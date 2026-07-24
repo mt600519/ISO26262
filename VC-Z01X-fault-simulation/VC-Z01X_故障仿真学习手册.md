@@ -60,7 +60,8 @@ ISO 26262 用三个硬件指标量化，故障仿真给出的**诊断覆盖率�
 | **VC Z01X 编译器**（基于 VCS） | 把 DUT 编译成可注入故障的模型 | `simv` + `simv.daidir` |
 | **vc_fcc**（Fault Campaign Compiler） | 生成故障清单、完成塌缩 | 写入 FDB |
 | **vc_fcm**（Fault Campaign Manager，FCM） | 总控：建 campaign、派测试、调度集群、跑仿真、出报告 | 交互/脚本 |
-| **Z01X 并发引擎（COATS）** | 参考机与多个故障机并发推进并比较 | — |
+| **fsim（Z01X 并发故障仿真引擎）** | 参考机与多个故障机并发推进并比较 | FCM 的 `fsim` 命令 |
+| **tsim / coats** | 翻转（toggle）仿真与**动态可测性分析**，与 fsim 并列的独立步骤，非并发仿真引擎 | FCM 的 `coats` 命令、`vc_coats` |
 | **FDB**（Fault Database） | 故障与结果数据库 | `fdb_connect` 连接 |
 | **SFF**（Standard Fault Format） | 贯穿全流程的文本文件 | 既是输入也是输出 |
 
@@ -99,8 +100,8 @@ Z01X 的故障模型分两类用途——**功能安全（ISO 26262）** 与 **�
 
 | 故障模型 | 用途 | 建模的缺陷 | 放置位置 | 子类型 |
 |----------|------|-----------|----------|--------|
-| **Stuck‑At（固定）** | **功能安全** | 永久缺陷（短路、开路、tie 常量） | primitive 端子/模块端口/net/array | sa0、sa1（6 类位置） |
-| **Transient（瞬态/软错误）** | **功能安全** | SEU 软错误（粒子翻转，瞬时） | **时序元件输出、存储器** | 发生一次即消失 |
+| **Stuck‑At（固定）** | **功能安全** | 永久缺陷（短路、开路、tie 常量） | primitive 端子/模块端口/net/变量/array | sa0、sa1（6 类故障类型，见 §2.3） |
+| **Transient（瞬态/软错误）** | **功能安全** | SEU / SET 软错误（粒子翻转、电源毛刺，瞬时） | 存储元件、端口、变量、数组（类型标记 `~`） | Transient SEU（单周期）、Transient Hold（多周期） |
 | Transition（时延/跳变） | 制造测试 | 跳变过慢 | wire/primitive/port | slow‑to‑rise(R)、slow‑to‑fall(F) |
 | Bridge（桥接） | 制造测试 | 两 net 短接 | 一对 net | wire、wor、wand |
 
@@ -113,17 +114,31 @@ Z01X 的故障模型分两类用途——**功能安全（ISO 26262）** 与 **�
 
 | 项 | 内容 |
 |----|------|
-| 6 类位置 | input sa0/sa1、output sa0/sa1、net sa0/sa1 |
+| **6 类 stuck‑at 类型**（UG p81） | **Input**（primitive/UDP/module 的某个输入）、**Output**（其输出）、**Net**（整条 net）、**Var**（`reg/logic/bit/byte` 变量）、**Array**（上述类型数组的各 bit）等——每一类都可钉 s@0 或 s@1。注意"6 类"指的是**位置类型**，不是"3 个位置 × 2 个值" |
+| 生成开关 | WIRE / VARI 故障：编译加 `-fsim` 即可自动使能；**PORT 故障需 `-fsim=portfaults`** |
+| 不支持 | 连续赋值语句（`ASGN` 类）不支持，vc_fcc 会报 `Warning-[FCC-UNSUPPORTED-FAULT-CLASS]` 并跳过 |
 | Single stuck‑at | 一次钉死一个位置，由 vc_fcc 自动生成，**功能安全主力** |
-| Multipoint stuck‑at | 同时钉死多个位置，只能经 SFF 手工/脚本描述，位置间用 `+` 连接 |
+| Multipoint stuck‑at | 同时钉死多个位置，只能经 SFF 手工/脚本描述（MFO 格式），位置间用 `+` 连接 |
 
 ### 2.4 Transient（瞬态/软错误）——ISO 26262 的另一半
 
-**只发生一次、随即消失**的故障（原文 "faults that occur once and then disappear"），建模 **软错误 / SEU**。
+**只发生一次、随即消失**的故障（原文 "faults that occur once and then disappear"），由辐射粒子撞击、电源毛刺等引起，
+不造成永久硬件损伤——即**软错误（soft error）/ SEU**。SFF 里的**类型标记是 `~`**（区别于 stuck‑at 的 `0`/`1`）。
+
+**两个子型（UG p78‑79，务必分清）**：
+
+| 子型 | 建模机制 | 持续时间 | SFF 写法 |
+|------|----------|----------|----------|
+| **Transient SEU** | Verilog `$deposit` | **单周期**：存储元件保持该值直到下一次输入变化驱动新赋值 | `NA ~ (6) {PORT "test.d1.q"}`（第 6 周期注入） |
+| **Transient Hold** | Verilog `force` / `release` | **多周期**：force 住若干周期，release 后保持当前值直到下次赋值 | `NA ~ ([6^9]) {PORT "test.d1.q"}`（第 6～9 周期） |
+
+**放置（Transient Fault Class Specifiers，UG p90‑91）**：
 
 | 项 | 内容 |
 |----|------|
-| 放置限制 | 只能放在**时序元件（触发器/寄存器）输出**和**存储器（memory）**上 |
+| 支持的类 | `~` 模型下支持 **ARRY / PORT / VARI / FLOP** 四类；**PRIM / WIRE 不支持**与 `~` 组合 |
+| 不指定类时 | 默认按 **FLOP** 行为：回溯到驱动存储单元的输出，或在该层次下所有 flop/latch 位置生成故障 |
+| FLOP 类含义 | 时序 UDP 的输出引脚，或编译期在 RTL 中识别出的时序元件 |
 | 对 ISP 的意义 | line/frame buffer、寄存器、SRAM 的软错误靠 **ECC/parity** 覆盖 |
 | 支撑的指标 | 量化 SM 对软错误的诊断覆盖 + 评估**潜伏故障 LFM**（仅做 stuck‑at 无法回答） |
 
@@ -138,13 +153,16 @@ Z01X 的故障模型分两类用途——**功能安全（ISO 26262）** 与 **�
 
 ### 2.6 故障位置对象与塌缩
 
-**故障位置对象（Fault Location Types，支持通配）**：
+**故障类（Fault Class，SFF 里的位置类型关键字，共 6 个，支持通配）**：
 
-| 关键字 | 含义 | 关键字 | 含义 |
-|--------|------|--------|------|
-| `PORT` | 端口 | `ARRY` | 数组 |
-| `PRIM` | primitive 端子 | `VARI` | 变量 |
-| `WIRE`/`NET` | 连线 | `FLOP` | 触发器 |
+| 关键字 | 含义 | 备注 |
+|--------|------|------|
+| `PORT` | 端口故障 | 需 `-fsim=portfaults` |
+| `PRIM` | primitive 输入/输出端子 | 输出端子记为 `0`，输入端子从 `1` 起按位置编号 |
+| `WIRE` | net 故障 | **关键字只有 `WIRE`，没有 `NET`** |
+| `ARRY` | 数组故障 | 与向量 `<location>` 组合时按 bit 展开 |
+| `VARI` | 变量故障 | 与数组组合时按 word 展开；与向量组合时按 bit 展开 |
+| `FLOP` | 时序 UDP / RTL 时序元件的输出 | SFF 专用类，用于描述保持信号的元件 |
 
 **故障塌缩（Fault Collapsing）与 Prime Fault**：
 
@@ -185,16 +203,41 @@ Z01X 把"故障暴露"拆成两层，对应 ISO 26262 的两个问题：
 
 ### 3.3 UCFD 系统任务（User Controlled Fault Detection）
 
-用于自定义观测/检测行为的系统任务（UG p251）。**只在 FM 生效**，不改变参考仿真，若在 GM 执行会告警：
+用于自定义观测/检测行为的系统任务。**只在 FM 生效**，不改变参考仿真，若在 GM 执行会打 warning。
+
+**UG p251 列出的 UCFD 任务全集**（手册正文只挑了常用的，这里补全，审查时被问到要能报全）：
 
 | 系统任务/函数 | 作用 |
 |---------------|------|
-| `$fs_compare` | 比较 GM/FM 指定信号；工具自动按 `#0 … #0` 同步，避免竞争 |
-| `$fs_observe` | 比较 SFF `Observe` 块信号（观测点）；只在 FM 有效 |
-| `$fs_detect` | 比较 SFF `Detect` 块信号（诊断点） |
-| `$fs_strobe` | 在**指定时刻**比较列出的选通点 |
-| `$fs_strobe_onevent()` | 信号**每次变化时**比较（持续监视，无需给定时刻） |
-| `$fs_set_status` / `$fs_drop_status` | 手工设置 / 丢弃某故障状态 |
+| `$fs_compare` | 比较 GM/FM 指定信号；工具自动按 `#0 $fs_compare #0` 处理以保证比较时 GM/FM 值已同步 |
+| `$fs_observe` | 比较 SFF `Observe` 块信号（观测点）；无需传参 |
+| `$fs_detect` | 比较 SFF `Detect` 块信号（诊断点）；无需传参 |
+| `$fs_drop_status` | 设置故障状态**并把它移出仿真** |
+| `$fs_set_status` | 设置故障状态但**继续仿真**该故障 |
+| `$fs_default_status` | 设置仿真中故障的默认状态 |
+| `$fs_get_status` | 返回某故障的当前状态 |
+| `$fs_drop_status_onevent` | 一旦出现 GM/FM 差异即设状态并移出仿真 |
+| `$fs_set_status_onevent` | 一旦出现 GM/FM 差异即设状态，继续仿真 |
+| `$fs_disable_onevent` | 取消上面两个 `_onevent` 的信号监视 |
+
+**`$fs_compare` / `$fs_observe` / `$fs_detect` 的返回值（三者一致）**：
+
+| 返回值 | 含义 |
+|--------|------|
+| `0` | 所有信号 GM=FM（**在 GM 中调用也恒返回 0**） |
+| `1` | 某信号 GM 为 0/1，FM 为相反值 → 判为检测 |
+| `2` | 某信号 GM 为 0/1，FM 为 `x`/`z` → 不确定（potential） |
+| — | 同时满足 1 和 2 的条件时返回 `1` |
+
+**Strobe 系统任务**（UG p279‑280，与上面的 UCFD 任务分属不同小节，别混为一谈）：
+
+| 系统任务 | 作用 |
+|----------|------|
+| `$fs_strobe` | 在**该任务被执行的时刻**比较列出的选通点 |
+| `$fs_strobe_onevent()` | 列出的信号**每次变化时**比较（持续监视，无需给定时刻） |
+
+> `$fs_compare` 列出的信号在故障生成阶段会被当作 strobe 点；GM 调用 `$fs_compare` 后，
+> 时间步结束时会触发振荡检查与 hyperfault 检查。
 
 ### 3.4 Strobe 的两种定义方式
 
@@ -207,18 +250,27 @@ Z01X 把"故障暴露"拆成两层，对应 ISO 26262 的两个问题：
 
 | 陷阱 / 实践 | 说明 | 出处 |
 |-----------|------|------|
-| **observe+detect 写在同一 procedural block** | 拆成两个独立 `always` 块 → 执行顺序不定 → 故障结果**非确定性** | UG p253 |
+| **observe+detect 写在同一 procedural block** | 拆成两个独立 `always` 块 → 两块可能在同一时间步内以任意顺序执行 → 故障结果**非确定性** | UG p252 |
+| **用 `always @(...)` 这类靠信号变化激活的块** | 放在带延时的 `initial` 里达不到效果——并非所有 FM 都会为该块发散（diverge）；推荐 `always @(<信号表>)` / `always @(*)` / `forever @(<信号表>)` | UG p252 |
 | **strobe 集必须覆盖所有可观测位置** | 端口不在 strobe 列表 → 故障被标 **UU**，默认**不计未检测** → 覆盖率**虚高** | Mfg Guide p195 |
 | strobe 只在 FM 生效 | 在 GM 执行报 warning，属正常 | UG p251 |
 | 无 strobe 的测试会被移出 | 日志 `Error: Test t1 contains no strobes` 必须处理，不能忽略 | Mfg Guide p324 |
 
-推荐写法：
+推荐写法（UG p252‑253 原例：观测与诊断合并在**一个** procedural block 内，避免竞争）：
 ```verilog
-always @(negedge clk) begin
+always (negedge clk)
    cmp = $fs_compare(observe_signal);
-   if (cmp == /*已观测*/) ... else $fs_drop_status("ND", detect_signal);
-end
+   if (cmp == 1)
+      $fs_set_status("ON", observe_signal);   // 已观测到，但继续仿真该故障
+   status = $fs_get_status();
+   cmp = $fs_compare(detect_signal);
+   if (cmp == 1)
+      if (status == "ON")
+         $fs_drop_status("OD", detect_signal);  // 危险且被诊断
+      else
+         $fs_drop_status("ND", detect_signal);  // 未观测到
 ```
+> 注：`ON` / `OD` 是**用户自定义状态（UDFS）**，需先在 SFF 的 `StatusDefinitions` 里定义（见 §4.5）。
 
 ---
 
@@ -226,26 +278,41 @@ end
 
 ### 4.1 两字符状态码：观测 × 检测
 
-一个故障类用**两个字符**表示（UG p257）：
+**所有**故障类（fault class）都用**两个字符**表示，可归入 status group 供报告使用（UG p269）。
+状态码不区分大小写、默认输出大写，每个码带引号描述串（描述串最长 2501 字符，且必须互不相同）。
 
-| 位置 | 含义 |
+> ⚠️ **注意适用范围**：UG p257 说的"**第 1 字符 = 观测状态、第 2 字符 = 检测状态**"，
+> 是**功能安全环境下自定义状态（UDFS）的命名约定**——"Any two-character status can be used and the
+> definitions created that are relevant for your functional safety environment"。
+> **内建状态不按这个规则解读**：`DT` 不是"D 观测 + T 检测"，`PT`/`UT`/`ND` 同理，它们是整体的助记码。
+> 只有你自己按 `ON`/`OD`/`NN` 这种风格定义 UDFS 时，两字符才承载"观测 × 检测"语义。
+
+| 位置 | 含义（**仅 UDFS 约定**） |
 |------|------|
 | 第 1 字符 | **观测状态（observation）**：是否传播到观测点 |
 | 第 2 字符 | **检测状态（detection）**：是否被安全机制检测到 |
 
-> 状态码不区分大小写、默认输出大写，每个码带引号描述串。可组成 **status group**（两字符缩写+组名+成员）用于报告。
 > 例：`OD "Observed Diagnosed"`（已观测 且 已诊断）。
 
 ### 4.2 内建故障状态组
 
-| 内建组 | 含义 | 代表成员 |
+按 UG 第 6 章 "Interpreting Fault Status"（p51‑60）的**完整**分组如下：
+
+| 内建组 | 含义 | 成员（全集） |
 |--------|------|----------|
-| **DG（Detected）** | 已检测 | DT、DD、DE、DF、DO |
-| **Potential** | 潜在检测（含 X 不确定） | PT、PD |
-| **Untestable（UG）** | 结构不可测 = 功能安全里的**安全故障** | UT、UU、UB、UR、UI、UO |
-| **Not Detected** | 未检测 | ND、NC、NN、NO |
-| Hyper / Oscillating | 超故障 / 振荡故障 | HA、OZ |
-| Collapsed | 塌缩（跟随 prime） | `--` |
+| **Detected（DG）** | 已检测 | `DT`、`DD`、`DE`、`DF` |
+| **Potential** | 潜在检测（含 X 不确定） | `PT`、`PD` |
+| **Oscillating** | 振荡故障 | `OZ` |
+| **Hyper** | 超活跃故障 | `HA` |
+| **Illegal** | 非法访问/操作 | `IA`、`IP`、`IF`、`IX` |
+| **Unselected** | 未被激励选中/未观测到 | `NS`、`NI`、`NO`、`NC`、`NT` |
+| **Untestable（UG）** | 结构不可测 = 功能安全里的**安全故障** | `UU`、`UT`、`UB`（Z01X 独立仿真器另有 `UR`/`UI`/`UO`，见 Mfg Guide p150） |
+| **不属于任何内建组** | — | `NA`（Not Attempted）、`ND`（Not Detected）、`EN`（Excluded）、`--`（Collapsed） |
+
+> ⚠️ 三个常见误记，**别再沿用**：
+> ① **没有叫 "Not Detected" 的内建组**——`ND` 是独立状态，`NC/NO/NS/NI/NT` 属于 **Unselected** 组；
+> ② **不存在 `NN` 和 `DO` 这两个内建状态码**；
+> ③ **Hyper 与 Oscillating 是两个独立的组**，不是一个 "Hyper/Oscillating" 组。
 
 ### 4.3 关键状态详解
 
@@ -255,18 +322,20 @@ end
 |------|------|
 | `DT`（Detected） | 被检测**至少一次、未达最大次数** |
 | `DD`（**Dropped Detected**） | 被检测**达最大次数**后丢弃；阈值 `-fsim=maxhard:<num>`，**默认 1** |
-| `DE`（Detected Error） | 故障机触发 assertion → `$fatal`/`$error` |
-| `DF` / `DO` | 其他已检测细分（`DO` 由 `$fs_set_status`/`$fs_drop_status` 赋值） |
+| `DE`（Detected Error） | 故障机触发 Verilog assertion，导致 `$fatal` / `$error`（assert 默认调 `$error`） |
+| `DF`（**Detected $finish/$stop**） | 故障机执行到 `$finish` / `$stop` 而被判为检测 |
 
 > ⚠️ **命名陷阱**：`DD` 的**内建**含义是 **"Dropped Detected"**；但功能安全 **UDFS** 里用户常把 `DD`
-> **重定义**为 **"Dangerous Diagnosed"**。二者完全不同，只是复用同一两字符码——出示 SFF 时务必讲清用的是哪个。
+> 借用为 **"Dangerous Diagnosed"**。二者完全不同，只是复用同一两字符码——出示 SFF 时务必讲清用的是哪个。
+> 而且这种复用**必须先 `Redefine DD <新码> "<新描述>"`** 把内建 `DD` 腾走（见 §4.5），否则 SFF 直接报错。
+> 建议干脆别复用 `DD`，用 `OD`/`ON` 这类未被占用的码，省掉一层歧义。
 
 **Potential 组**：
 
 | 状态 | 含义 |
 |------|------|
-| `PT`（Potential） | X 值导致"可能被检测"的不确定情形；覆盖率通常按 **0.5 权重**折算 |
-| `PD`（Dropped Potential） | 达丢弃阈值的 potential 故障 |
+| `PT`（Potential Detect） | X 值导致"可能被检测"的不确定情形（GM 为 0/1 而 FM 为 x/z）；覆盖率按 **0.5 权重**折算 |
+| `PD`（Dropped Potential） | potential 检测达到最大次数后丢弃；阈值 `-fsim=maxpot:<num>`，**默认 1**（注意与 detected 的 `maxhard` 是两个开关） |
 
 **Untestable 组（= 功能安全里的 Safe fault，UG p62/p271，Mfg Guide p150）**：
 
@@ -281,14 +350,19 @@ end
 | `UI`（Untestable Imported） | 导入清单时无法判因，仅 import 时赋值 | — |
 | `UO` | 其他不可测类别 | — |
 
-**Not Detected 组**：`ND`（未检测，含 GM=X、FM=known）、`NC`/`NN`/`NO` 等"未观测/未检测"组合。
+**`ND`（Not Detected）与 Unselected 组**：`ND` 是**独立状态**（已仿真但未被检测）；
+`NS`（Not Strobed）、`NI`（Not Injected）、`NO`（Not Observed）、`NC`（Not Controlled）、`NT`（Not Tested）
+属 **Unselected 组**，含义是"激励没把它选到/没观测到"，与"仿真了但没测出来"不是一回事——审查时容易被追问，别混用。
 
 **特殊故障**：
 
 | 状态 | 含义 | 处理 |
 |------|------|------|
-| `HA`（Hyperfault，超故障） | 引发海量事件、极慢/耗内存（破坏时钟/复位网络） | **默认移除**（建议保留此默认），**按危险故障计入覆盖**；用 Resolving Hyperfaults 单独判定（UG p276） |
-| `OZ`（Oscillating，振荡） | 信号无休止振荡 | 优先级高于 PT，判定后不再反复仿真 |
+| `HA`（**Hyperactive**，属 Hyper 组） | 故障影响范围不大但产生海量故障机事件（FM/GM 事件比超阈值），极慢/耗内存 | **默认从仿真中丢弃**（建议保留此默认）；权重 **0.0** → 计入分母但不计入分子，即**按未检测/危险故障处理**；用 "Resolving Hyperfaults" 流程（关掉 hyperfault 检查重跑）单独判定（UG p54/p276） |
+| `OZ`（Oscillating, Zero） | 信号无休止振荡 | 优先级高于 PT，判定后不再反复仿真；权重 0.0 |
+
+> Z01X 独立仿真器（Manufacturing 流程）里 hyperfault 还细分 `HA`/`HT`/`HM`，并可用 `$fs_drop_hyper` 主动丢弃；
+> 重跑时**原本是 HA 且仍未被检测的故障，报告里仍记为 HA**，只有跑出更高等级状态才会被提升。
 
 > HA/OZ 优先级**高于** potential(PT)——副作用是 potential 覆盖可能在测试间下降。
 
@@ -302,29 +376,61 @@ end
 
 ### 4.5 UDFS 与 ISO 26262 映射
 
-**UDFS（User‑Defined Fault Status）**：用户在 SFF 里重定义/新增两字符状态与分组。
-**复用任何内建两字符码前，必须先重定义该内建状态**并声明交互方式（UG p257）。典型功能安全 UDFS：
+**UDFS（User‑Defined Fault Status）**：用户在 SFF 的 `StatusDefinitions` 块里重定义/新增两字符状态与分组。
+
+**三条硬性规则（写错就跑不起来，UG p106/p113）**：
+
+1. 块名是 **`StatusDefinitions`（复数）**，不是 `StatusDefinition`。
+2. **要复用某个内建两字符码，必须先 `Redefine` 把它腾出来**：
+   `Redefine <旧码> <新的未占用码> "<新描述>";`——旧状态的行为不变，只是换了个码。不先 redefine 直接定义会**报错并导致 fault creation 失败**。
+3. **用 UDFS 时 `DefaultStatus(<status>)` 是必需的**，用来指定"仿真过但没有被任何 strobe 系统任务定状态"的故障落到哪个状态。
+4. 状态**分组**要写在 `StatusDefinitions` 内部的 **`StatusGroups` 子块**里，语法是
+   `<组的两字符ID> "<组名>" (<状态1>, <状态2>, …);`——**成员列表不能直接挂在状态定义后面**。
+   一个状态只能属于一个组（重复归组时以最后一次为准）。
+
+典型功能安全 UDFS（可直接照抄的正确骨架）：
 
 ```
-StatusDefinition {
-    DD "Dangerous Diagnosed"      (ND, NP, OD);   // 危险—被 SM 诊断（注意 DD 已被重定义！）
-    DN "Dangerous Not Diagnosed"  (ON, OP, PN);   // 危险—未被诊断（残余/潜伏）
-    SA "Safe"                     (UB, UR, UT, UU);// 安全故障（Untestable + 结构安全）
-    SU "Dangerous Unobserved"     (NC, NN, NO, NT);
+StatusDefinitions
+{
+    // 1) 先把内建 DD (Dropped Detected) 腾出来，才能把 DD 用作 "Dangerous Diagnosed"
+    Redefine DD DX "Dropped Detected";
+
+    // 2) 定义功能安全语义的用户状态（第1字符=观测，第2字符=诊断）
+    OD "Observed Diagnosed";        // 危险 且 被 SM 诊断
+    ON "Observed Not Diagnosed";    // 危险 但 未被诊断 → 残余/潜伏故障
+    NN "Not Observed";              // 未传播到安全相关输出 → 安全
+
+    // 3) 用 UDFS 时必须给默认状态
+    DefaultStatus(NN)
+
+    // 4) 分组写在 StatusGroups 子块里
+    StatusGroups
+    {
+        DA "Dangerous Diagnosed"     (OD);          // 组 ID 也必须是两个字符
+        DN "Dangerous Not Diagnosed" (ON, HA, OZ);  // 把超故障/振荡保守地算作危险未诊断
+        SA "Safe"                    (UU, UT, UB, NN);
+    }
 }
-Coverage {
-    "Diagnostic Coverage" = "DD / (NA + DA + DN + DD)";
+
+Coverage
+{
+    "Diagnostic Coverage" = "OD / (OD + ON)";
 }
 ```
+
+> Coverage 段是**独立的顶层段**，语法 `<方程名> = "<格式>(<方程>)";`；格式可选 `PCT`（默认）/`INT`/`FLT`；
+> 方程名含空格/分号/等号时要加引号。方程名若写成 `Test Coverage` 或 `Fault Coverage`，会**覆盖内建公式**。
+> **用了 UDFS 就必须定义 Coverage 方程**，否则报告 Summary 段不会有任何覆盖率数字。
 
 映射到 ISO 26262（帮助向审查方解释）：
 
 | ISO 26262 概念 | 在 Z01X 里的体现 |
 |----------------|------------------|
-| Safe fault（安全故障） | Untestable（UT/UU/UB/UR）+ 结构安全 → `Safe` 组 |
-| Single‑Point / Residual Fault（未被 SM 覆盖） | 危险且未被诊断 → `DN` |
-| SPF/RF 中被 SM 覆盖的部分 | 危险且被诊断 → `DD`（此处 = Dangerous Diagnosed） |
-| Diagnostic Coverage (DC) | `DD /（全部危险故障）` 覆盖方程 |
+| Safe fault（安全故障） | Untestable（`UU`/`UT`/`UB`）+ 未传播到安全相关输出（`NN`）→ `SA` 组 |
+| Single‑Point / Residual Fault（未被 SM 覆盖） | 危险且未被诊断 → `ON`（归入 `DN` 组） |
+| SPF/RF 中被 SM 覆盖的部分 | 危险且被诊断 → `OD`（归入 `DA` 组） |
+| Diagnostic Coverage (DC) | `OD / (OD + ON)` 覆盖方程 |
 | Latent / Multi‑point Fault（LFM） | Transient + 第二重 SM 的观测/诊断点定义相应组 |
 
 ---
@@ -342,16 +448,23 @@ Coverage {
 
 ### 5.2 Weighted_Total 与权重
 
-`Weighted_Total = Σ(各状态计数 × 权重)`，例：`DD×w + DT×w + PD×w + PT×w + …`
+`Weighted_Total = Σ(各状态计数 × 权重)`，即 `(DD×DD_weight) + (DT×DT_weight) + (PD×PD_weight) + (PT×PT_weight) + (NA×NA_weight) + …`
 
-| 状态 | 典型权重 |
-|------|----------|
-| 已检测（DD/DT） | 1 |
-| potential（PT/PD） | **0.5**（半计，体现不确定性） |
+**默认权重（UG p216 原文）**：
+
+| 权重 | 状态 |
+|------|------|
+| **1.0** | `DD`、`DT`、`DE`、`DF` |
+| **0.5** | `PD`、`PT`（半计，体现 X 带来的不确定性） |
+| **0.0** | `NA`、`ND`、`OZ`、`HA`、`IA`、`IX`、`NC`、`NO`、`NS`、`NI`、`NT`、`UU`、`UT`、`UB`、`UR`、`UI`、`UO`、`EN` |
+
+> 塌缩故障（`--`）**继承其 prime/等价故障的权重**。
+> 权重被调整过时，Fault Report 里会专门列一段 "Coverage Calculation Weights" —— 审查时这段要一起出示。
+> 注意 `HA` 权重为 0：它计入 `Total` 分母但不进分子，等价于**按未检测的危险故障处理**。
 
 ### 5.3 Diagnostic Coverage / SPFM / LFM
 
-功能安全用的 **DC 是用户在 SFF Coverage 段自定义**的方程（非上面两个内建式），一般 `DD /（全部危险）`，进一步喂：
+功能安全用的 **DC 是用户在 SFF Coverage 段自定义**的方程（非上面两个内建式），一般 `已诊断的危险故障 /（全部危险故障）`，进一步喂：
 
 | ISO 26262 指标 | 近似关系 |
 |----------------|----------|
@@ -375,8 +488,8 @@ SFF 是贯穿输入输出的核心文本文件，审查必看（UG 第 9 章 / M
 
 | 段（Section） | 用途 | 备注 |
 |---------------|------|------|
-| Block / Test Information | 文件头、块与测试信息 | — |
-| **Fault Status Definition** | 定义/重定义两字符状态与分组（UDFS） | 功能安全语义在此 |
+| Header / Version | 文件头与版本信息 | — |
+| **`StatusDefinitions`** | 定义/重定义两字符状态、`DefaultStatus`、`StatusGroups`（UDFS） | 功能安全语义在此；**注意块名是复数** |
 | **Coverage** | 定义覆盖率方程（含 DC） | 用 UDFS 时**必须**提供 |
 | **Strobe** | 声明选通信号（等价 `$fs_strobe_onevent`） | 无需改 TB |
 | StrobeData | 报告用：故障命中时显示的引脚状态 | 仅输出 |
@@ -410,26 +523,34 @@ SafetyMechanism sm_lockstep {
 | `create_campaign` | 定义并创建故障宇宙（读 SFF、指定 DUT、daidir） |
 | `create_testcases` | 定义测试用例（可执行、参数、UVM testname） |
 | `fdb_connect` | 连接 FDB（`fsim` 前提） |
-| `set_campaign` / `set_config` | 选定当前 campaign / 设置运行配置 |
+| **`set_campaign`** | **加载已有 campaign**（续跑/复跑就靠它，不需要另存会话） |
+| `set_config` | 设置运行配置 |
+| `exclude_faults` | 按状态组等条件排除故障 |
+| `coats` | 动态可测性分析（与 fsim 并列的独立步骤） |
 | `fsim` | 执行故障仿真，自动管理集群作业与重试 |
 | `report` | 生成覆盖率报告（可随时出） |
-| `save_session` | 保存会话（断点续跑） |
 | `quit` / `exit` | 退出 FCM |
 
-**脚本示例**：
+> ⚠️ **没有 `save_session` 这个命令**——两本手册里都查不到。要在已有 campaign 上继续跑，用
+> `set_campaign -campaign <name>` 加载即可；FDB 本身就持久化了故障与结果。
+
+**脚本示例**（选项名按 UG p84 校正）：
 ```tcl
 create_campaign -args "-full64 -daidir simv.daidir \
-                       -campaign fc1 -sff user.sff -dut test.dut"
+                       -sff user.sff -dut_path <DUT 层次路径> -campaign fc1"
 create_testcases -name test1 -exec "$::env(PWD)/simv" \
                  -args "+UVM_TESTNAME=test1"
 catch {fsim}
-report -campaign fc1 -report user_coverage.sff -overwrite
+report -report user_coverage.sff -overwrite -showfaultid
 ```
+> 续跑已有 campaign 时把第一条换成 `set_campaign -campaign fc1`。
 
 | 用途 | 选项 |
 |------|------|
-| 分布式调度 | `-max_faults_per_task`、`-localhost`、作业失败自动 retry |
-| 调试发散输出 | `create_testcases -fsim_args -fsim=fault+messages+all`（发散行打 `<FID>` 标签） |
+| 单任务故障数上限（控内存/运行时长） | `set_config -max_faults_per_fsim_task <int>`（**不是** `-max_faults_per_task`） |
+| 分布式调度 | `-localhost`、`-fsim_timeout <秒>`、作业失败自动 retry |
+| 调试发散输出 | `create_testcases -fsim_args "-fsim=fault+messages"`；定位单条故障用 `-fsim=fault+messages+<fault id>` |
+| 导入已有 toggle 结果 | `create_testcases -fsdb <filename>` |
 | 完整语法 | 附录 A（FCM Commands）/ 附录 B（Command Syntax） |
 
 ---
@@ -455,14 +576,14 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 | 阶段 | 做什么 | 关键点 |
 |------|--------|--------|
 | **0 备输入** | 设计（门级网表+库）、激励（UVM/VCD/forcelist）、SM 检测信号清单、FMEDA 初稿、集群 | 功能安全 SPFM/LFM 通常基于门级 |
-| **1 编译+验证好机** | VC Z01X 编译产 `simv`/`daidir`；**先跑无故障逻辑仿真** | `-fsim=dut:<层次>` 阻止故障传播到 DUT 外；穿 class 加 `-fsim=class` |
+| **1 编译+验证好机** | VC Z01X 编译产 `simv`/`daidir`；**先跑无故障逻辑仿真** | `-fsim=dut:<层次>`（**编译期**选项）阻止故障传播到 DUT 外；穿 class 加 `-fsim=class`；要 PORT 故障加 `-fsim=portfaults` |
 | **2 定义观测/诊断点** | Observe 放安全相关输出；Detect 放 SM 检测输出；或 SFF `Strobe` 段 | observe+detect 同一 block；strobe 覆盖所有可观测位置（防虚高） |
 | **3 生成故障清单** | `vc_fcc` 生成 fault universe、塌缩、写 FDB | 可选结构分析预识别 Untestable/安全故障 |
-| **4 编写 SFF** | UDFS 状态分组、Coverage 方程、SafetyMechanism/FailureMode | DC 方程加注释对应 ISO 26262‑5；注意 DD 重定义 |
+| **4 编写 SFF** | `StatusDefinitions`（UDFS + `DefaultStatus` + `StatusGroups`）、`Coverage` 方程、`SafetyMechanism`/`FailureMode` | DC 方程加注释对应 ISO 26262‑5；复用内建码前先 `Redefine`；用 UDFS 就**必须**给 `DefaultStatus` 和 Coverage 方程 |
 | **5 建 campaign** | `create_campaign` → `create_testcases` | 见 §7 脚本 |
 | **6 跑故障仿真** | `catch {fsim}` | 分布式并发 |
 | **7 出报告+迭代** | `report`；盯 **DN**（危险未诊断）列 | 增强 SM 观测点（参考 Observability Targeted Report）/补激励/论证 safe，回阶段 2/5 迭代 |
-| **8 归档** | 脚本、SFF、种子、`simv`、报告、版本号；`save_session` 续跑 | 完成 CoU/AoU 检查表 |
+| **8 归档** | 脚本、SFF、种子、`simv`、FDB、报告、工具版本号；续跑靠 `set_campaign` 加载已有 campaign | 完成 CoU/AoU 检查表 |
 
 **一页流程图**：
 ```
@@ -487,13 +608,15 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 | # | 陷阱 | 后果 | 应对 | 出处 |
 |---|------|------|------|------|
 | 1 | strobe 集不完整 | 故障标 UU、默认不计未检测 → 覆盖率**虚高** | 生成故障含所有可观测位置；核查 UU 占比 | Mfg p195 |
-| 2 | observe/detect 拆多个 always 块 | 结果**非确定** | 写在同一 procedural block | UG p253 |
-| 3 | `DD` 双重含义 | 审查误解 | 内建=Dropped Detected；UDFS=Dangerous Diagnosed，出示时讲清 | UG p60/p273 |
+| 2 | observe/detect 拆多个 always 块 | 结果**非确定** | 写在同一 procedural block | UG p252 |
+| 3 | `DD` 双重含义 | 审查误解 / SFF 直接报错 | 内建=Dropped Detected；要当 Dangerous Diagnosed 用**必须先 `Redefine`**，或干脆改用 `OD` | UG p52/p106 |
+| 3b | `StatusDefinition` 写成单数、成员列表没包在 `StatusGroups` 里、漏 `DefaultStatus` | fault creation 失败 | 照 §4.5 骨架写 | UG p106/p113 |
 | 4 | Untestable 默认不计覆盖 | 安全故障未论证 | 当"安全故障"须有结构论证，不只靠工具默认 | UG p271 |
-| 5 | Hyperfault 默认移除但按危险计 | 当作已解决 | 用 Resolving Hyperfaults 单独判定 | UG p276 |
-| 6 | X 态处理 | 高估覆盖 | 保守计未检测/potential；PT 按 0.5 折算 | UG p52 |
+| 5 | Hyperactive(`HA`) 默认丢弃、权重 0 | 当作已解决 | 用 Resolving Hyperfaults 单独判定；重跑后仍未检测的仍记 `HA` | UG p54/p276 |
+| 6 | X 态处理 | 高估覆盖 | 保守计未检测/potential；PT 按 0.5 折算 | UG p52‑53 |
 | 7 | 忽略日志 Warning/Error | 违反 CoU；测试被静默移除 | 逐条审阅所有消息 | §10 / Mfg p324 |
-| 8 | Fault dropping 阈值 | 多 SM 覆盖评估失真 | `-fsim=maxhard` 默认 1，不要过早 drop | UG p52 |
+| 8 | Fault dropping 阈值 | 多 SM 覆盖评估失真 | `-fsim=maxhard` / `-fsim=maxpot` 默认均为 1，不要过早 drop | UG p52‑53 |
+| 9 | 混用 `ND` 与 Unselected 组（`NS`/`NO`/`NC`/`NT`） | "没测出来"和"根本没选到"混为一谈，DC 分母失真 | 报告里分开统计并分别论证 | UG p56‑60 |
 
 ---
 
@@ -513,16 +636,16 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 
 | # | 问题 | 应答要点 |
 |---|------|----------|
-| 1 | 用什么故障模型？为什么？ | 功能安全用 **Stuck‑At + Transient**：SA 对应永久故障（6 类位置，支撑 SPFM）；transient 对应 SEU 软错误（放 FF 输出与存储器），评估 ECC/parity 对 LFM 的覆盖。Transition/Bridge 属制造测试。 |
+| 1 | 用什么故障模型？为什么？ | 功能安全用 **Stuck‑At + Transient**：SA 对应永久故障（input/output/net/var/array 六类位置类型，支撑 SPFM）；transient 对应 SEU/SET 软错误（`~` 类型，分单周期 SEU 与多周期 Hold，落在 FLOP/ARRY/PORT/VARI 类位置），评估 ECC/parity 对 LFM 的覆盖。Transition/Bridge 属制造测试。 |
 | 2 | 全故障还是抽样？代表性？ | vc_fcc 基于门级网表全量生成+塌缩；如抽样，给方法、置信区间、样本量依据。 |
-| 3 | 安全故障如何识别论证？ | Untestable（tie/unused/redundant/blocked）+ 结构安全；每类留工程论证，不只靠工具默认。 |
-| 4 | DC 方程如何定义？对应 SPFM/LFM？ | 出示 SFF Coverage 段（`DD/(全部危险)`），解释 DD=Dangerous Diagnosed 如何进入 SPFM=1−ΣRF/Σ(SPF+RF)。 |
+| 3 | 安全故障如何识别论证？ | Untestable 组（`UU` unused / `UT` tied / `UB` blocked，独立仿真器另有 `UR` redundant）+ 结构安全；每类留工程论证，不只靠工具默认。 |
+| 4 | DC 方程如何定义？对应 SPFM/LFM？ | 出示 SFF `Coverage` 段（如 `OD/(OD+ON)`），解释"危险且被诊断"如何进入 SPFM=1−ΣRF/Σ(SPF+RF)；同时出示 Coverage Calculation Weights 段说明各状态权重。 |
 | 5 | 观测点/诊断点如何区分与保全覆盖？ | Observe=安全相关输出，Detect=SM 检测输出；strobe 覆盖所有可观测位置，出示 Observability Targeted Report。 |
 | 6 | X 态会否高估覆盖？ | 保守计未检测/potential，PT 按 0.5 折算；说明检测判据。 |
-| 7 | Hyperfault/振荡怎么处理？ | 默认移除但按危险计；用 Resolving Hyperfaults 单独判定，未静默丢弃。 |
+| 7 | Hyperactive/振荡怎么处理？ | `HA`/`OZ` 权重 0（等价按未检测计），`HA` 默认从仿真丢弃；用 Resolving Hyperfaults 流程单独重跑判定，未静默丢弃。 |
 | 8 | strobe 虚高如何避免？ | 生成故障含所有可观测位置；核查 UU 占比；observe/detect 同一 block。 |
 | 9 | 工具本身可信吗？ | 出示功能安全认证/qualification kit + CoU/AoU 符合性检查表。 |
-| 10 | 结果可复现吗？ | 保留脚本、SFF、种子、simv、报告、版本号；`save_session` 支持复跑。 |
+| 10 | 结果可复现吗？ | 保留脚本、SFF、种子、`simv`/`daidir`、FDB、报告与工具版本号；用 `set_campaign` 加载原 campaign 复跑。 |
 
 ---
 
@@ -531,8 +654,8 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 | 英文 | 中文 | 说明 |
 |------|------|------|
 | Fault Model | 故障模型 | Stuck‑At/Transient（功能安全）、Transition/Bridge（制造） |
-| Stuck‑At (sa0/sa1) | 固定型故障 | 值钉死 0/1，6 类位置 |
-| Transient | 瞬态/软错误故障 | 发生一次即消失，建模 SEU，放 FF 输出与存储器 |
+| Stuck‑At (s@0/s@1) | 固定型故障 | 值钉死 0/1；6 类位置类型：input/output/net/var/array 等 |
+| Transient (`~`) | 瞬态/软错误故障 | 发生一次即消失；SEU（`$deposit`，单周期）与 Hold（`force/release`，多周期）两个子型 |
 | Transition (R/F) | 时延/跳变故障 | slow‑to‑rise / slow‑to‑fall（制造） |
 | Bridge (wire/wor/wand) | 桥接故障 | 两 net 短接（制造） |
 | Fault Universe / List | 故障宇宙 / 清单 | 全部待注入故障 |
@@ -542,11 +665,14 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 | Observe vs Detect | 观测点 vs 诊断点 | 是否传播到输出 vs 是否被 SM 捕获 |
 | Safety Mechanism (SM) | 安全机制 | ECC、lockstep、CRC、STL 等 |
 | UCFD tasks | 用户控制故障检测任务 | `$fs_compare`/`observe`/`detect`/`strobe` 等 |
-| DG / Detected | 已检测组 | DT、DD(Dropped Detected)、DE 等 |
+| DG / Detected | 已检测组 | DT、DD(Dropped Detected)、DE(assertion)、DF($finish/$stop) |
 | Potential (PT/PD) | 潜在检测 | X 不确定，覆盖率按 0.5 折算 |
-| Untestable (UT/UU/UB/UR/UI) | 不可测组 | = 功能安全里的安全故障 |
-| Fault Dropping / maxhard | 故障丢弃 | 检测达阈值后不再仿真（默认 1 次） |
-| UDFS | 用户自定义故障状态 | 功能安全语义（如 DD=Dangerous Diagnosed） |
+| Unselected (NS/NI/NO/NC/NT) | 未选中组 | 激励没选到/没观测到，**与 ND 不是一回事** |
+| Untestable (UU/UT/UB) | 不可测组 | = 功能安全里的安全故障（独立仿真器另有 UR/UI/UO） |
+| Hyperactive (HA) / Oscillating (OZ) | 超活跃 / 振荡故障 | 两个独立的组，权重均为 0 |
+| Fault Dropping / maxhard / maxpot | 故障丢弃 | 检测/potential 达阈值后不再仿真（默认均 1 次） |
+| UDFS | 用户自定义故障状态 | 在 `StatusDefinitions` 块内定义，需配 `DefaultStatus` 与 Coverage 方程 |
+| COATS | 动态可测性分析 | FCM 的 `coats` 命令 / `vc_coats`，**不是**并发故障仿真引擎 |
 | Test / Fault Coverage | 测试/故障覆盖率 | 分母是否含 Untestable |
 | Diagnostic Coverage (DC) | 诊断覆盖率 | SFF 自定义方程，喂 SPFM/LFM |
 | SPFM / LFM / PMHF | 单点/潜伏故障度量、随机失效概率 | ISO 26262 硬件指标 |
@@ -556,5 +682,11 @@ report -campaign fc1 -report user_coverage.sff -overwrite
 
 ---
 
-*本手册基于本地 RAG 检索的官方文档片段（VC Z01X User Guide 与 Manufacturing Assurance Guide, X‑2025.06）整理。
-命令语法、状态码与覆盖率公式的权威定义，请以你所用 Z01X 版本的 User Guide 正文与附录 A/B 为准。*
+*本手册基于官方文档（VC Z01X User Guide 与 Z01X Manufacturing Assurance User Guide, X‑2025.06）整理。
+**修订说明（v2）**：全文命令名、SFF 语法、内建故障状态与分组、故障模型分类已对 UG 全文逐条复核，
+修正了首版中的以下问题：不存在的 `save_session` 命令、`-dut`→`-dut_path`、`-max_faults_per_task`→
+`-max_faults_per_fsim_task`、COATS 定位、`StatusDefinitions` 块语法（复数/`StatusGroups`/`DefaultStatus`/`Redefine`）、
+虚构状态码 `NN`/`DO`、内建状态分组结构、`DF` 含义、`HA`=Hyperactive、stuck‑at "6 类"的实际所指、transient 的
+Hold/SEU 两个子型与可用故障类。
+覆盖率公式（§5.1）、`maxhard`/`maxpot` 默认值、`$fs_compare` 系列返回值、FailureMode/SafetyMechanism
+语法为原文核对无误。仍建议以你所用 Z01X 版本的 User Guide 正文与附录 A/B 复核后再用于审查。*
