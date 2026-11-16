@@ -20,3 +20,5 @@
 
 > 依据 Synopsys《VC Z01X User Guide, X‑2025.06》与《Z01X Manufacturing Assurance User Guide, X‑2025.06》整理。
 > 命令语法与状态码请以所用版本 User Guide 正文与附录 A/B 为准。
+
+- [Z01X并行仿真划分与瞬态故障](./Z01X并行仿真划分与瞬态故障.md)：分模块活动、结果合并、FMEDA 汇总与瞬态故障配置。
